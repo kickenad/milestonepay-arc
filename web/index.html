@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilestonePay — USDC milestone escrow on Arc</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:860px;margin:24px auto;padding:0 16px;color:#111}
+h1{margin-bottom:4px}small{color:#666}fieldset{border:1px solid #ddd;border-radius:8px;margin:14px 0;padding:12px}
+input,select,button{font:inherit;padding:6px 8px;margin:3px 0}input{width:100%;box-sizing:border-box}
+button{cursor:pointer;border:1px solid #333;border-radius:6px;background:#fff}button.p{background:#111;color:#fff}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1}#log{background:#f6f6f6;padding:8px;border-radius:6px;white-space:pre-wrap;font-size:13px;max-height:220px;overflow:auto}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #eee;padding:4px;text-align:left;font-size:14px}
+</style></head><body>
+<h1>MilestonePay</h1><small>Milestone escrow for freelancers, paid in USDC on Arc. Client locks USDC → freelancer submits → client approves (or the freelancer can claim after the review window).</small>
+
+<fieldset><legend>Wallet & network</legend>
+<div class="row"><select id="net"><option value="testnet">Arc Testnet (5042002)</option><option value="mainnet">Arc Mainnet (5042) — REAL USDC</option></select>
+<input id="addr" placeholder="MilestonePay contract address 0x…"></div>
+<button class="p" id="connect">Connect wallet</button> <span id="me"></span>
+</fieldset>
+
+<fieldset><legend>1. Client: create & fund a job</legend>
+<input id="free" placeholder="Freelancer address 0x…">
+<input id="arb" placeholder="Arbiter address (optional, blank = none)">
+<input id="amts" placeholder="Milestone amounts in USDC, comma separated, e.g. 1,2">
+<div class="row"><input id="title" placeholder="Job title"><input id="review" type="number" value="24" title="review hours"><input id="days" type="number" value="14" title="deadline days"></div>
+<small>Review window (hours), deadline (days). Two transactions: USDC approve, then createJob.</small><br>
+<button class="p" id="create">Approve USDC & create job</button>
+</fieldset>
+
+<fieldset><legend>2. View / act on a job</legend>
+<div class="row"><input id="jid" type="number" placeholder="Job ID" value="1"><button id="load">Load job</button></div>
+<div id="job"></div>
+</fieldset>
+<div id="log"></div>
+<script type="module">
+import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.min.js";
+const NETS = {
+  testnet:{chainId:5042002,hex:"0x4cef52",name:"Arc Testnet",rpc:"https://rpc.testnet.arc.io",exp:"https://explorer.testnet.arc.io"},
+  mainnet:{chainId:5042,hex:"0x13b2",name:"Arc",rpc:"https://rpc.mainnet.arc.io",exp:"https://explorer.arc.io"}};
+const USDC="0x3600000000000000000000000000000000000000";
+const ERC20=["function approve(address,uint256) returns (bool)","function allowance(address,address) view returns (uint256)","function balanceOf(address) view returns (uint256)"];
+const ABI = await (await fetch("abi.json")).json();
+const ST=["None","Funded","Submitted","Disputed","Paid","Refunded","Resolved"];
+const $=id=>document.getElementById(id); const log=m=>{$("log").textContent=m+"\n"+$("log").textContent};
+const q=new URLSearchParams(location.search); if(q.get("net"))$("net").value=q.get("net"); if(q.get("c"))$("addr").value=q.get("c");
+let signer, me;
+const net=()=>NETS[$("net").value];
+async function connect(){
+  if(!window.ethereum) return log("No wallet found (install MetaMask or Rabby).");
+  const n=net();
+  try{await ethereum.request({method:"wallet_switchEthereumChain",params:[{chainId:n.hex}]})}
+  catch(e){await ethereum.request({method:"wallet_addEthereumChain",params:[{chainId:n.hex,chainName:n.name,rpcUrls:[n.rpc],nativeCurrency:{name:"USDC",symbol:"USDC",decimals:18},blockExplorerUrls:[n.exp]}]})}
+  const p=new ethers.BrowserProvider(window.ethereum); signer=await p.getSigner(); me=await signer.getAddress();
+  const bal=await new ethers.Contract(USDC,ERC20,p).balanceOf(me);
+  $("me").textContent=`${me.slice(0,8)}… on ${n.name} · ${ethers.formatUnits(bal,6)} USDC`;
+}
+const pay=()=>{ if(!signer) throw Error("connect wallet first"); return new ethers.Contract($("addr").value.trim(),ABI,signer) };
+async function send(label,txp){ const tx=await txp; log(`${label}: sent ${net().exp}/tx/${tx.hash}`); const r=await tx.wait(); log(`${label}: confirmed in block ${r.blockNumber}`); return r }
+const guard=f=>async()=>{try{await f()}catch(e){log("Error: "+(e.shortMessage||e.message))}};
+$("connect").onclick=guard(connect);
+$("create").onclick=guard(async()=>{
+  const c=pay(); const amts=$("amts").value.split(",").map(s=>ethers.parseUnits(s.trim(),6)); const total=amts.reduce((a,b)=>a+b,0n);
+  if($("net").value==="mainnet" && !confirm(`This moves ${ethers.formatUnits(total,6)} REAL USDC into escrow on Arc mainnet. Continue?`)) return;
+  const u=new ethers.Contract(USDC,ERC20,signer);
+  if((await u.allowance(me,c.target))<total) await send("approve USDC",u.approve(c.target,total));
+  const dl=BigInt(Math.floor(Date.now()/1000)+Number($("days").value)*86400);
+  const r=await send("createJob",c.createJob($("free").value.trim(),$("arb").value.trim()||ethers.ZeroAddress,amts,BigInt(Number($("review").value)*3600),dl,$("title").value||"Job"));
+  const ev=r.logs.map(l=>{try{return c.interface.parseLog(l)}catch{return null}}).find(e=>e&&e.name==="JobCreated");
+  if(ev){$("jid").value=ev.args.jobId; load()}
+});
+async function load(){
+  const c=pay(), id=$("jid").value; const j=await c.jobs(id); const ms=await c.milestones(id);
+  const role=[j.client===me&&"client",j.freelancer===me&&"freelancer",j.arbiter===me&&"arbiter"].filter(Boolean).join("+")||"viewer";
+  let h=`<p><b>${j.title}</b> · client ${j.client.slice(0,8)}… · freelancer ${j.freelancer.slice(0,8)}… · you are <b>${role}</b><br>review ${Number(j.reviewPeriod)/3600}h · deadline ${new Date(Number(j.deadline)*1000).toLocaleString()}</p><table><tr><th>#</th><th>USDC</th><th>Status</th><th>Actions</th></tr>`;
+  ms.forEach((m,i)=>{
+    const b=(fn,t)=>`<button data-fn="${fn}" data-i="${i}">${t}</button>`; let a="";
+    const s=ST[Number(m.status)];
+    if(role.includes("freelancer")&&(s==="Funded"))a+=b("submit","Submit work");
+    if(role.includes("freelancer")&&s==="Submitted")a+=b("claimAfterTimeout","Claim after timeout");
+    if(role.includes("freelancer")&&["Funded","Submitted","Disputed"].includes(s))a+=b("releaseToClient","Refund client");
+    if(role.includes("client")&&["Funded","Submitted","Disputed"].includes(s))a+=b("approve","Approve & pay");
+    if(role.includes("client")&&s==="Submitted")a+=b("dispute","Dispute");
+    if(role.includes("client")&&s==="Disputed")a+=b("reopen","Reopen");
+    if(role.includes("client")&&s==="Funded")a+=b("refundUnsubmitted","Refund (after deadline)");
+    if(role.includes("arbiter")&&s==="Disputed")a+=b("resolve","Resolve split");
+    h+=`<tr><td>${i}</td><td>${ethers.formatUnits(m.amount,6)}</td><td>${s}</td><td>${a}</td></tr>`;
+  });
+  $("job").innerHTML=h+"</table>";
+  $("job").querySelectorAll("button").forEach(btn=>btn.onclick=guard(async()=>{
+    const fn=btn.dataset.fn,i=btn.dataset.i; let args=[id,i];
+    if(fn==="submit"){const d=prompt("Deliverable link or text (its hash is stored on-chain)");if(!d)return;args.push(ethers.id(d))}
+    if(fn==="resolve"){const p=prompt("Percent to freelancer (0-100)");if(p===null)return;args.push(Math.round(Number(p)*100))}
+    await send(fn,c[fn](...args)); await load();
+  }));
+}
+$("load").onclick=guard(load);
+</script></body></html>
